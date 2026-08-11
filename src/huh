@@ -1,0 +1,358 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+
+#include <nlohmann/json.hpp>
+
+using namespace std;
+using json = nlohmann::json;
+
+struct Product {
+    string product_id;
+    string name;
+    string category_id;
+    string region;
+    int popularity_score;
+};
+
+class BrowseEngine {
+private:
+    unordered_map<string, vector<string>> children;
+    unordered_set<string> categoryExists;
+
+    vector<Product> products;
+
+public:
+
+    void loadCategories(const string& filename) {
+
+        ifstream file(filename);
+
+        if (!file.is_open()) {
+            throw runtime_error("Unable to open categories.json");
+        }
+
+        json data;
+        file >> data;
+
+        for (const auto& category : data["categories"]) {
+
+            string id = category["category_id"];
+
+            categoryExists.insert(id);
+
+            if (!category["parent_id"].is_null()) {
+
+                string parentId = category["parent_id"];
+
+                children[parentId].push_back(id);
+            }
+        }
+    }
+
+
+    void loadProducts(const string& filename) {
+
+        ifstream file(filename);
+
+        if (!file.is_open()) {
+            throw runtime_error("Unable to open products.json");
+        }
+
+        string line;
+
+        while (getline(file, line)) {
+
+            if (line.empty())
+                continue;
+
+            json data = json::parse(line);
+
+            Product p;
+
+            // IMPORTANT:
+            // product_id = P1001
+            // name = Samsung Galaxy...
+            p.product_id = data["product_id"];
+            p.name = data["name"];
+            p.category_id = data["category_id"];
+            p.region = data["region"];
+            p.popularity_score = data["popularity_score"];
+
+            products.push_back(p);
+        }
+    }
+
+
+    void collectDescendants(
+        const string& categoryId,
+        unordered_set<string>& included
+    ) {
+
+        if (included.count(categoryId))
+            return;
+
+        included.insert(categoryId);
+
+        auto it = children.find(categoryId);
+
+        if (it == children.end())
+            return;
+
+        for (const string& child : it->second) {
+
+            collectDescendants(child, included);
+        }
+    }
+
+
+    json processRequest(
+        const string& categoryId,
+        const string& region,
+        int maxResults
+    ) {
+
+        json result;
+
+        result["matched_count"] = 0;
+        result["products"] = json::array();
+
+
+        // --------------------------------------------------
+        // Category does not exist
+        // --------------------------------------------------
+
+        if (!categoryExists.count(categoryId)) {
+            return result;
+        }
+
+
+        // --------------------------------------------------
+        // STEP 1:
+        // Get requested category + ALL descendants
+        // --------------------------------------------------
+
+        unordered_set<string> includedCategories;
+
+        collectDescendants(
+            categoryId,
+            includedCategories
+        );
+
+
+        // --------------------------------------------------
+        // STEP 2:
+        // Filter products
+        // --------------------------------------------------
+
+        vector<Product> eligible;
+
+        for (const Product& product : products) {
+
+            // Product must belong to requested category
+            // or one of its descendants.
+
+            if (!includedCategories.count(product.category_id))
+                continue;
+
+
+            // Region must match EXACTLY.
+            if (product.region != region)
+                continue;
+
+
+            eligible.push_back(product);
+        }
+
+
+        // matched_count is BEFORE max_results
+        result["matched_count"] = eligible.size();
+
+
+        // --------------------------------------------------
+        // STEP 3:
+        // Sort
+        //
+        // popularity_score: HIGH -> LOW
+        // product_id:       LOW  -> HIGH
+        // --------------------------------------------------
+
+        sort(
+            eligible.begin(),
+            eligible.end(),
+            [](const Product& a, const Product& b) {
+
+                if (a.popularity_score != b.popularity_score) {
+
+                    return a.popularity_score >
+                           b.popularity_score;
+                }
+
+                return a.product_id < b.product_id;
+            }
+        );
+
+
+        // --------------------------------------------------
+        // STEP 4:
+        // Return first max_results
+        // --------------------------------------------------
+
+        int count = min(
+            maxResults,
+            static_cast<int>(eligible.size())
+        );
+
+        for (int i = 0; i < count; i++) {
+
+            json product;
+
+            // VERY IMPORTANT:
+            // Do NOT swap these two.
+
+            product["product_id"] =
+                eligible[i].product_id;
+
+            product["name"] =
+                eligible[i].name;
+
+            product["category_id"] =
+                eligible[i].category_id;
+
+            product["popularity_score"] =
+                eligible[i].popularity_score;
+
+            result["products"].push_back(product);
+        }
+
+        return result;
+    }
+};
+
+
+int main() {
+
+    try {
+
+        BrowseEngine engine;
+
+
+        // --------------------------------------------------
+        // Load input data
+        // --------------------------------------------------
+
+        engine.loadCategories(
+            "data/categories.json"
+        );
+
+        engine.loadProducts(
+            "data/products.jsonl"
+        );
+
+
+        // --------------------------------------------------
+        // Read requests
+        // --------------------------------------------------
+
+        ifstream requestFile(
+            "data/requests.jsonl"
+        );
+
+        if (!requestFile.is_open()) {
+            throw runtime_error(
+                "Unable to open requests.jsonl"
+            );
+        }
+
+
+        json results = json::array();
+
+        string line;
+
+        while (getline(requestFile, line)) {
+
+            if (line.empty())
+                continue;
+
+            json request = json::parse(line);
+
+
+            string queryId =
+                request["query_id"];
+
+            string categoryId =
+                request["category_id"];
+
+            string region =
+                request["region"];
+
+
+            int maxResults =
+                request.value("max_results", 5);
+
+
+            // --------------------------------------------------
+            // Process request
+            // --------------------------------------------------
+
+            json browseResult =
+                engine.processRequest(
+                    categoryId,
+                    region,
+                    maxResults
+                );
+
+
+            // --------------------------------------------------
+            // Build final response
+            // --------------------------------------------------
+
+            json response;
+
+            response["query_id"] =
+                queryId;
+
+            response["matched_count"] =
+                browseResult["matched_count"];
+
+            response["products"] =
+                browseResult["products"];
+
+
+            results.push_back(response);
+        }
+
+
+        // --------------------------------------------------
+        // Write results.json
+        // --------------------------------------------------
+
+        ofstream outputFile(
+            "data/results.json"
+        );
+
+        if (!outputFile.is_open()) {
+            throw runtime_error(
+                "Unable to create results.json"
+            );
+        }
+
+        outputFile << results.dump(4) << '\n';
+
+
+        cout << "Successfully generated results.json\n";
+    }
+
+    catch (const exception& e) {
+
+        cerr << "Error: " << e.what() << '\n';
+
+        return 1;
+    }
+
+    return 0;
+}
